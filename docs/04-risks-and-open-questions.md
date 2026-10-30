@@ -14,7 +14,9 @@
 | Dishonest attester | Paid by the borrower to approve | Accreditation, bonds, liability, payment by lenders or the registry, two attesters for large assets | Collusion between several parties |
 | Stolen key | Attacker signs attestations | `compromised_since`, revocation, re-attestation | Damage done before discovery |
 | Guessing pledged invoices | Hash likely invoice values, compare | Fingerprint uses a secret key held by the operator | Operator compromise exposes the key |
-| Stale valuation | Equipment worth less a year later | `expires_at` on valuations; headroom labelled indicative | Lenders treating headroom as a guarantee |
+| Stale valuation | Equipment worth less a year later | Depreciation schedules; appraisals expire; STALE overrides PASS | Real-world wear differs from the schedule |
+| Bad or manipulated price | Feed publishes a wrong price, or a thinly traded stock is pushed up | Signed prices, accredited sources, staleness limits, haircuts | One source is a single point of failure; use the median of several |
+| Inflated depreciation schedule | Appraiser sets an unrealistically long useful life | Accreditation, bonds, re-appraisal requirements | Collusion between borrower and appraiser |
 
 ## Open questions
 
@@ -31,12 +33,14 @@
 6. **How should headroom be shown?** As a number, a band, or not at all? A number invites lenders to over-rely on it.
 7. **Who pays?** A per-pledge fee from lenders keeps attesters independent of borrowers.
 8. **Search by fingerprint.** Should anyone be able to search using identity fields, or only admitted lenders? Open search makes it easier to check whether specific invoices are pledged.
+9. **Should seniors share balances with juniors?** Junior tests count senior pledges at their full cap, which is safe but harsh. A senior could choose to share its balance with named juniors through an access grant.
+10. **Should breaches be ledger events?** A signed breach notice proves when each party was told, which matters for cure periods.
 
 ### Operating model
 
-9. **Who runs it?** An industry association, a utility like DTCC, a state, or a startup. Anchoring to a public chain reduces how much participants have to trust the operator.
-10. **What gets lenders to join?** It's useless until the major lenders in one asset class all check it. Recent double-pledging losses are the strongest pitch.
-11. **Which asset class first?** Equipment finance (serial numbers, existing dealer networks) or receivables finance (where double-pledging hurts most).
+11. **Who runs it?** An industry association, a utility like DTCC, a state, or a startup. Anchoring to a public chain reduces how much participants have to trust the operator.
+12. **What gets lenders to join?** It's useless until the major lenders in one asset class all check it. Recent double-pledging losses are the strongest pitch.
+13. **Which asset class first?** Equipment finance (serial numbers, existing dealer networks) or receivables finance (where double-pledging hurts most).
 
 ## Not legal advice
 

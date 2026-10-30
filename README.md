@@ -12,20 +12,24 @@ Third parties attest that assets exist and assign standard asset IDs. Borrower a
 | [docs/02-data-model.md](docs/02-data-model.md) | Entities, relationships, fingerprints, priority rules, lifecycles, who sees what |
 | [docs/03-workflows.md](docs/03-workflows.md) | Sequence diagrams: register, attest, pledge, check, release, receivables, key compromise |
 | [docs/04-risks-and-open-questions.md](docs/04-risks-and-open-questions.md) | Threats and mitigations, legal and product questions |
+| [docs/05-valuation.md](docs/05-valuation.md) | Valuation models (depreciation, market price, appraisal) and covenant tests |
 | [schema/registry.sql](schema/registry.sql) | Reference schema (SQLite) |
-| [examples/demo.py](examples/demo.py) | Runnable walk-through of the whole flow |
+| [examples/registry.py](examples/registry.py) | Reference implementation used by both demos |
+| [examples/demo.py](examples/demo.py) | Walk-through: register, attest, pledge, check, release |
+| [examples/valuation_demo.py](examples/valuation_demo.py) | Walk-through: depreciation, market prices, covenant tests |
 
 Diagrams are written in Mermaid. They render on GitHub, in VS Code with a Mermaid extension, and in most Markdown viewers.
 
-## Run the demo
+## Run the demos
 
 Requires Python 3.9+, no packages.
 
 ```bash
-python3 examples/demo.py
+python3 examples/demo.py             # pledging and checking
+python3 examples/valuation_demo.py   # valuation and covenants
 ```
 
-The demo runs this scenario: Acme Paving registers an excavator, a dealer attests its identity, and an appraiser values it at $120,000. First Bank lends against it with an $80,000 cap. Acme then tries to register the same machine under a different description and is rejected. River Credit searches the registry, sees First Bank's pledge, and checks the contract Acme shows it. A doctored copy fails the check. River lends $30,000 in second position and moves up to first when First Bank's pledge is released. Finally, the ledger's hash chain is verified and an attempt to edit history is blocked.
+`demo.py` runs this scenario: Acme Paving registers an excavator, a dealer attests its identity, and an appraiser values it at $120,000. First Bank lends against it with an $80,000 cap. Acme then tries to register the same machine under a different description and is rejected. River Credit searches the registry, sees First Bank's pledge, and checks the contract Acme shows it. A doctored copy fails the check. River lends $30,000 in second position and moves up to first when First Bank's pledge is released. Finally, the ledger's hash chain is verified and an attempt to edit history is blocked.
 
 ```
 == 5. Acme tries to register the same excavator again, worded differently
@@ -40,7 +44,19 @@ The demo runs this scenario: Acme Paving registers an excavator, a dealer attest
    doctored copy (cap changed to $20,000) matches: False
 ```
 
-The demo simulates signatures with HMAC so it has no dependencies. A real system would use public-key signatures such as Ed25519.
+`valuation_demo.py` values the same excavator on a 7-year depreciation schedule and shows the second-position lender breaching its covenant a year before the first. It then values 100,000 restricted shares from a price feed and tracks a 50% loan-to-value covenant through WARN, BREACH and STALE as the price falls and the feed stops:
+
+```
+== 3. Daily tests as the share price falls
+   2026-11-02  value $4,000,000  (100,000 × $40.00, priced 2026-11-02)  [OK]
+      rank 1 Harbor Bank              35.7% vs max 50% LTV   PASS    exposure $1,000,000 cap, breaks below $2,857,143
+   2026-11-03  value $3,000,000  (100,000 × $30.00, priced 2026-11-03)  [OK]
+      rank 1 Harbor Bank              47.6% vs max 50% LTV   WARN    exposure $1,000,000 cap, breaks below $2,857,143
+   2026-11-04  value $2,500,000  (100,000 × $25.00, priced 2026-11-04)  [OK]
+      rank 1 Harbor Bank              57.1% vs max 50% LTV   BREACH  exposure $1,000,000 cap, breaks below $2,857,143
+```
+
+The demos simulate signatures with HMAC so it has no dependencies. A real system would use public-key signatures such as Ed25519.
 
 ## Status
 

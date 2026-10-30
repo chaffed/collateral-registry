@@ -26,7 +26,7 @@ CREATE TABLE party (
 -- One party can hold several roles (a bank can borrow and lend).
 CREATE TABLE party_role (
     party_id    TEXT NOT NULL REFERENCES party(party_id),
-    role        TEXT NOT NULL CHECK (role IN ('BORROWER', 'LENDER', 'ATTESTER', 'OPERATOR')),
+    role        TEXT NOT NULL CHECK (role IN ('BORROWER', 'LENDER', 'ATTESTER', 'PRICE_SOURCE', 'OPERATOR')),
     granted_at  TEXT NOT NULL,
     revoked_at  TEXT,
     PRIMARY KEY (party_id, role)
@@ -79,7 +79,10 @@ INSERT INTO asset_class (code, name, identity_fields, required_attestation) VALU
                       '["seller_registration_id","obligor_registration_id","invoice_number","amount_minor","currency","issue_date"]',
                       'OBLIGOR_CONFIRMATION'),
     ('WAREHOUSE_LOT', 'Inventory held under a warehouse receipt',
-                      '["warehouse_registration_id","receipt_number"]', 'EXISTENCE');
+                      '["warehouse_registration_id","receipt_number"]', 'EXISTENCE'),
+    ('SECURITY_HOLDING', 'Shares or bonds held directly on the issuer''s or transfer agent''s books',
+                      '["issuer_registration_id","share_class","holder_registration_id","position_id"]',
+                      'OWNERSHIP');
 
 -- The asset record. The fingerprint is a keyed hash of the normalized identity
 -- fields: the same physical asset always produces the same fingerprint, however
@@ -173,6 +176,88 @@ CREATE TABLE dispute (
 );
 
 -- ---------------------------------------------------------------------------
+-- Valuation and covenants
+-- ---------------------------------------------------------------------------
+--
+-- What an asset is worth is a fact about the asset, attested once. How much of
+-- that value a lender counts (haircut) and what ratio it requires (covenant) are
+-- terms of each loan. Inputs below are ledger events; valuations and test results
+-- are computed from them and can be reproduced for any date.
+
+-- How an asset's value is worked out. Only one model per asset is current
+-- (superseded_seq IS NULL). params is JSON and depends on the method:
+--   APPRAISAL          {"value_minor", "as_of", "valid_days"}
+--   STRAIGHT_LINE      {"basis_minor", "basis_date", "useful_life_years", "salvage_minor"}
+--   DECLINING_BALANCE  {"basis_minor", "basis_date", "annual_rate_bp", "salvage_minor"}
+--   MARKET_PRICE       {"instrument_id", "quantity", "source_id"}
+CREATE TABLE valuation_model (
+    model_id        TEXT PRIMARY KEY,
+    asset_id        TEXT NOT NULL REFERENCES asset(asset_id),
+    method          TEXT NOT NULL CHECK (method IN
+                    ('APPRAISAL', 'STRAIGHT_LINE', 'DECLINING_BALANCE', 'MARKET_PRICE')),
+    params          TEXT NOT NULL,
+    attestation_id  TEXT NOT NULL REFERENCES attestation(attestation_id),  -- who vouched for it
+    recorded_seq    INTEGER NOT NULL REFERENCES ledger_event(seq),
+    superseded_seq  INTEGER REFERENCES ledger_event(seq)
+);
+
+-- A feed that publishes signed prices (an exchange, a market-data vendor, a fund
+-- administrator for NAV). Prices older than max_staleness_seconds make any test
+-- that depends on them STALE rather than PASS.
+CREATE TABLE price_source (
+    source_id              TEXT PRIMARY KEY,
+    name                   TEXT NOT NULL,
+    operator_party_id      TEXT NOT NULL REFERENCES party(party_id),
+    max_staleness_seconds  INTEGER NOT NULL
+);
+
+CREATE TABLE price_observation (
+    observation_id  TEXT PRIMARY KEY,
+    source_id       TEXT NOT NULL REFERENCES price_source(source_id),
+    instrument_id   TEXT NOT NULL,         -- ISIN, CUSIP, or internal ID
+    price_minor     INTEGER NOT NULL,      -- per unit
+    currency        TEXT NOT NULL,
+    observed_at     TEXT NOT NULL,         -- market time, not ledger time
+    recorded_seq    INTEGER NOT NULL REFERENCES ledger_event(seq)
+);
+
+-- A loan covenant tied to a pledge, signed by borrower and lender.
+--   MIN_COVERAGE  value available to this pledge / exposure  >= threshold  (12500 = 1.25x)
+--   MAX_LTV       exposure / value available to this pledge  <= threshold  (5000 = 50%)
+-- "Value available" is the asset value after this lender's haircut, minus the
+-- caps of every pledge ranked ahead of it.
+CREATE TABLE covenant (
+    covenant_id     TEXT PRIMARY KEY,
+    pledge_id       TEXT NOT NULL REFERENCES pledge(pledge_id),
+    kind            TEXT NOT NULL CHECK (kind IN ('MIN_COVERAGE', 'MAX_LTV')),
+    threshold_bp    INTEGER NOT NULL,
+    haircut_bp      INTEGER NOT NULL DEFAULT 0,     -- discount the lender applies to value
+    warn_margin_bp  INTEGER NOT NULL DEFAULT 1000,  -- WARN within 10% of the threshold
+    recorded_seq    INTEGER NOT NULL REFERENCES ledger_event(seq)
+);
+
+-- Results of covenant tests. A cache, not the source of truth: any row can be
+-- recomputed from the valuation model, price observations and covenant terms.
+-- Visible to the pledge's borrower and lender only, since reported balances are private.
+CREATE TABLE covenant_test (
+    test_id               TEXT PRIMARY KEY,
+    covenant_id           TEXT NOT NULL REFERENCES covenant(covenant_id),
+    as_of                 TEXT NOT NULL,
+    asset_value_minor     INTEGER,
+    lending_value_minor   INTEGER,         -- after haircut
+    senior_claims_minor   INTEGER NOT NULL,
+    available_minor       INTEGER,
+    exposure_minor        INTEGER NOT NULL,
+    exposure_basis        TEXT NOT NULL CHECK (exposure_basis IN ('CAP', 'REPORTED')),
+    ratio_bp              INTEGER,         -- NULL when infinite or not computable
+    breach_value_minor    INTEGER,         -- asset value below which the covenant fails
+    result                TEXT NOT NULL CHECK (result IN
+                          ('PASS', 'WARN', 'BREACH', 'STALE', 'NO_MODEL', 'NO_PRICE')),
+    price_observation_id  TEXT REFERENCES price_observation(observation_id),
+    computed_at           TEXT NOT NULL
+);
+
+-- ---------------------------------------------------------------------------
 -- Ledger (source of truth)
 -- ---------------------------------------------------------------------------
 
@@ -184,7 +269,9 @@ CREATE TABLE ledger_event (
     event_type    TEXT NOT NULL CHECK (event_type IN (
                     'PARTY_ADMITTED', 'KEY_ADDED', 'KEY_REVOKED',
                     'ASSET_REGISTERED', 'ATTESTED', 'ATTESTATION_REVOKED',
+                    'VALUATION_MODEL_SET', 'PRICE_RECORDED',
                     'PLEDGE_RECORDED', 'PLEDGE_AMENDED', 'SUBORDINATED', 'PLEDGE_RELEASED',
+                    'COVENANT_SET',
                     'ACCESS_GRANTED', 'DISPUTE_RAISED', 'DISPUTE_RESOLVED')),
     subject_id    TEXT NOT NULL,           -- asset_id, pledge_id, party_id, ...
     payload       TEXT NOT NULL,           -- canonical JSON (sorted keys, no whitespace)
@@ -233,6 +320,9 @@ BEGIN SELECT RAISE(ABORT, 'event_signature is append-only'); END;
 CREATE INDEX pledge_by_asset      ON pledge (asset_id, status, priority_rank);
 CREATE INDEX attestation_by_asset ON attestation (asset_id);
 CREATE INDEX event_by_subject     ON ledger_event (subject_id);
+CREATE INDEX model_by_asset       ON valuation_model (asset_id, superseded_seq);
+CREATE INDEX price_by_instrument  ON price_observation (source_id, instrument_id, observed_at);
+CREATE INDEX covenant_by_pledge   ON covenant (pledge_id);
 
 -- What anyone can see: whether an asset is pledged, to whom, and in what order.
 -- Amounts and contract terms are left out.

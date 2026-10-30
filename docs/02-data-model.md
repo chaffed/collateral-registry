@@ -39,6 +39,11 @@ erDiagram
     party ||--o{ pledge : "borrower / secured party"
     pledge ||--o{ subordination : reorders
     pledge ||--o{ access_grant : "contract readable by"
+    asset ||--o{ valuation_model : "valued by"
+    attestation ||--|| valuation_model : vouches
+    price_source ||--o{ price_observation : publishes
+    pledge ||--o{ covenant : "bound by"
+    covenant ||--o{ covenant_test : "tested as"
     ledger_event ||--o{ event_signature : "signed by"
     ledger_event ||--|| asset : registered
     ledger_event ||--|| attestation : attested
@@ -100,6 +105,20 @@ The hash is keyed rather than plain because identity fields are guessable. Invoi
 
 **Caps, not balances.** `max_secured_minor` is the most a pledge can claim. Live loan balances aren't recorded, because lenders won't publish them and they change daily.
 
+### Valuation and covenants
+
+See [05-valuation.md](05-valuation.md) for the methods and the covenant math.
+
+| Table | Purpose | Key fields |
+|---|---|---|
+| `valuation_model` | How an asset's value is worked out; one current model per asset | `method` (APPRAISAL, STRAIGHT_LINE, DECLINING_BALANCE, MARKET_PRICE), `params`, `attestation_id` |
+| `price_source` | A feed that publishes signed prices | `operator_party_id`, `max_staleness_seconds` |
+| `price_observation` | One signed price | `instrument_id`, `price_minor`, `observed_at` |
+| `covenant` | A loan term on a pledge, signed by both parties | `kind` (MIN_COVERAGE, MAX_LTV), `threshold_bp`, `haircut_bp` |
+| `covenant_test` | Cached test results, reproducible from the inputs | `ratio_bp`, `breach_value_minor`, `result`, `exposure_basis` |
+
+The schema also adds a `SECURITY_HOLDING` asset class for shares held directly on an issuer's or transfer agent's books, identified by issuer, share class, holder and position.
+
 ### Ledger
 
 | Table | Purpose |
@@ -119,6 +138,9 @@ The hash is keyed rather than plain because identity fields are guessable. Invoi
 | `PLEDGE_RECORDED` / `PLEDGE_AMENDED` | Borrower **and** secured party |
 | `SUBORDINATED` | The lender giving up its place (and the borrower) |
 | `PLEDGE_RELEASED` | Secured party |
+| `VALUATION_MODEL_SET` | Accredited valuation attester |
+| `PRICE_RECORDED` | Price source |
+| `COVENANT_SET` | Borrower **and** secured party |
 | `ACCESS_GRANTED` | Borrower or secured party |
 | `DISPUTE_RAISED` | Any admitted party |
 | `DISPUTE_RESOLVED` | Operator (after the agreed dispute process) |
@@ -160,6 +182,8 @@ Nothing is ever deleted. "Released" and "void" are new events, and the original 
 | Active pledges: rank, secured party, recorded time, UCC-1 reference | ✓ | ✓ | ✓ |
 | Attestation summary (type, attester, date) | ✓ | ✓ | ✓ |
 | Pledge caps, latest valuation, indicative headroom | | ✓ | ✓ |
+| Valuation model and price history | | ✓ | ✓ |
+| Covenant terms and test results | | | Borrower and that lender |
 | Full contract | | | ✓ |
 
 These tiers match the two views in the schema: `public_pledge` and `lender_asset_position`. Showing the secured party's name publicly mirrors UCC-1 practice and lets a prospective lender contact the existing lender. Whether caps should be public too is an open question (see [04-risks-and-open-questions.md](04-risks-and-open-questions.md)).
