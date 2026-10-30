@@ -27,7 +27,7 @@ Valuation models, price observations and covenants are signed ledger events. Val
 | `APPRAISAL` | Anything with a one-off professional valuation | value, as-of date, valid days | The appraised value. **STALE** once past its valid period. |
 | `STRAIGHT_LINE` | Equipment, vehicles | basis value, basis date, useful life, salvage | basis − (basis − salvage) × min(1, years ÷ life) |
 | `DECLINING_BALANCE` | Assets that lose value fastest early (vehicles, tech) | basis, basis date, annual rate, salvage | max(salvage, basis × (1 − rate)^years) |
-| `MARKET_PRICE` | Securities, commodities, fund units (with NAV) | instrument, quantity, price source | quantity × latest price at or before *t*. **STALE** if the price is older than the source allows. |
+| `MARKET_PRICE` | Securities, commodities, fund units (with NAV) | instrument, price source | attested quantity held × latest price at or before *t*. **STALE** if the price is older than the source allows. |
 
 The attester who sets the model is accredited for `VALUATION` on that asset class, and their statement is hashed into a `VALUATION` attestation. Setting a new model (for example after a re-appraisal) supersedes the old one. The old one stays in the history.
 
@@ -52,7 +52,7 @@ flowchart LR
 ```
 
 - **Haircut** — the share of value the lender ignores, for volatility, forced-sale discounts or transfer restrictions. Each lender sets its own.
-- **Senior claims** — every pledge ranked ahead counts at its **full cap**. A junior lender can't see senior balances, and a revolving senior loan can be drawn back up to its cap at any time. This is deliberately cautious.
+- **Senior claims** — every pledge ranked ahead counts at its **full cap**. (Divisible assets such as shares skip this step: each pledge holds its own block of units, valued separately. See [06-partial-pledges.md](06-partial-pledges.md).) A junior lender can't see senior balances, and a revolving senior loan can be drawn back up to its cap at any time. This is deliberately cautious.
 - **Exposure** — the pledge's cap by default. A lender can **report its actual outstanding balance** for its own test. The reported balance stays out of the ledger and is visible only to that lender and the borrower.
 
 ### Results
@@ -90,16 +90,17 @@ $120,000 basis, straight-line over 7 years to $20,000. First Bank (rank 1, $80k 
 
 ### Restricted shares, market price
 
-100,000 shares. Harbor Bank lends up to $1,000,000, maximum 50% LTV, 30% haircut.
+Harbor Bank holds a pledge of 60,000 shares, up to $600,000, maximum 50% LTV, 30% haircut.
 
-| Date | Price | Value | LTV | Result |
+| Date | Price | Block value | LTV | Result |
 |---|---|---|---|---|
-| Nov 2 | $40.00 | $4,000,000 | 35.7% | PASS |
-| Nov 3 | $30.00 | $3,000,000 | 47.6% | WARN |
-| Nov 4 | $25.00 | $2,500,000 | 57.1% | **BREACH** |
-| Nov 9 | (no new price) | $2,500,000 | 57.1% | **STALE** |
+| Nov 2 | $40.00 | $2,400,000 | 35.7% | PASS |
+| Nov 3 | $30.00 | $1,800,000 | 47.6% | WARN |
+| Nov 4 | $25.00 | $1,500,000 | 57.1% | **BREACH** |
 
-Trigger price: **$28.57 per share** ($1,000,000 ÷ 50% ÷ 70% ÷ 100,000).
+Trigger price: **$28.57 per share** ($600,000 ÷ 50% ÷ 70% ÷ 60,000). If the feed then stopped publishing for more than three days, the result would turn **STALE**.
+
+The full example, with a second lender, a stock split, a top-up and a partial release, is in [06-partial-pledges.md](06-partial-pledges.md).
 
 ## What the registry does not do
 

@@ -13,10 +13,11 @@ Third parties attest that assets exist and assign standard asset IDs. Borrower a
 | [docs/03-workflows.md](docs/03-workflows.md) | Sequence diagrams: register, attest, pledge, check, release, receivables, key compromise |
 | [docs/04-risks-and-open-questions.md](docs/04-risks-and-open-questions.md) | Threats and mitigations, legal and product questions |
 | [docs/05-valuation.md](docs/05-valuation.md) | Valuation models (depreciation, market price, appraisal) and covenant tests |
+| [docs/06-partial-pledges.md](docs/06-partial-pledges.md) | Pledging shares and other divisible assets in blocks by quantity |
 | [schema/registry.sql](schema/registry.sql) | Reference schema (SQLite) |
 | [examples/registry.py](examples/registry.py) | Reference implementation used by both demos |
 | [examples/demo.py](examples/demo.py) | Walk-through: register, attest, pledge, check, release |
-| [examples/valuation_demo.py](examples/valuation_demo.py) | Walk-through: depreciation, market prices, covenant tests |
+| [examples/valuation_demo.py](examples/valuation_demo.py) | Walk-through: depreciation, market prices, covenant tests, partial pledges of shares |
 
 Diagrams are written in Mermaid. They render on GitHub, in VS Code with a Mermaid extension, and in most Markdown viewers.
 
@@ -44,19 +45,22 @@ python3 examples/valuation_demo.py   # valuation and covenants
    doctored copy (cap changed to $20,000) matches: False
 ```
 
-`valuation_demo.py` values the same excavator on a 7-year depreciation schedule and shows the second-position lender breaching its covenant a year before the first. It then values 100,000 restricted shares from a price feed and tracks a 50% loan-to-value covenant through WARN, BREACH and STALE as the price falls and the feed stops:
+`valuation_demo.py` values the same excavator on a 7-year depreciation schedule and shows the second-position lender breaching its covenant a year before the first. It then pledges 100,000 restricted shares in blocks to two lenders, rejects a third lender asking for more shares than are free, and tests each block against its own loan-to-value covenant as the price falls. Finally it runs a 2-for-1 split, a margin-call top-up, a partial release, and catches an overpledge:
 
 ```
-== 3. Daily tests as the share price falls
-   2026-11-02  value $4,000,000  (100,000 × $40.00, priced 2026-11-02)  [OK]
-      rank 1 Harbor Bank              35.7% vs max 50% LTV   PASS    exposure $1,000,000 cap, breaks below $2,857,143
-   2026-11-03  value $3,000,000  (100,000 × $30.00, priced 2026-11-03)  [OK]
-      rank 1 Harbor Bank              47.6% vs max 50% LTV   WARN    exposure $1,000,000 cap, breaks below $2,857,143
+== 3. A third lender asks for 20,000 shares
+   REJECTED: only 10,000 units are unpledged; 20,000 requested
+
+== 4. Daily tests as the share price falls — each block is tested on its own shares
+   ...
    2026-11-04  value $2,500,000  (100,000 × $25.00, priced 2026-11-04)  [OK]
-      rank 1 Harbor Bank              57.1% vs max 50% LTV   BREACH  exposure $1,000,000 cap, breaks below $2,857,143
+      60,000 sh  Harbor Bank              57.1% vs max 50% LTV   BREACH  exposure $600,000 cap, breaks below $1,714,286
+      30,000 sh  Summit Private Credit    51.3% vs max 50% LTV   BREACH  exposure $250,000 cap, breaks below $769,231
+   Harbor Bank breaches below $28.57 per share
+   Summit Private Credit breaches below $25.64 per share
 ```
 
-The demos simulate signatures with HMAC so it has no dependencies. A real system would use public-key signatures such as Ed25519.
+The demos simulate signatures with HMAC so they have no dependencies. A real system would use public-key signatures such as Ed25519.
 
 ## Status
 

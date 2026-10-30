@@ -117,7 +117,15 @@ See [05-valuation.md](05-valuation.md) for the methods and the covenant math.
 | `covenant` | A loan term on a pledge, signed by both parties | `kind` (MIN_COVERAGE, MAX_LTV), `threshold_bp`, `haircut_bp` |
 | `covenant_test` | Cached test results, reproducible from the inputs | `ratio_bp`, `breach_value_minor`, `result`, `exposure_basis` |
 
-The schema also adds a `SECURITY_HOLDING` asset class for shares held directly on an issuer's or transfer agent's books, identified by issuer, share class, holder and position.
+### Divisible assets and partial pledges
+
+See [06-partial-pledges.md](06-partial-pledges.md).
+
+- `asset_class.divisible` marks classes held as a quantity of interchangeable units: `SECURITY_HOLDING` (shares held directly on an issuer's or transfer agent's books) and `WAREHOUSE_LOT`.
+- `attestation.quantity` records units held, on the class's required attestation.
+- `pledge.quantity` records units pledged. It's required for divisible classes and must be empty for the rest.
+- The view `holding_position` shows attested, pledged and free units per asset.
+- Rule enforced by the registry: **units pledged across active pledges ≤ units attested as held.**
 
 ### Ledger
 
@@ -141,6 +149,7 @@ The schema also adds a `SECURITY_HOLDING` asset class for shares held directly o
 | `VALUATION_MODEL_SET` | Accredited valuation attester |
 | `PRICE_RECORDED` | Price source |
 | `COVENANT_SET` | Borrower **and** secured party |
+| `QUANTITY_ADJUSTED` | Transfer agent / issuer (stock split or consolidation) |
 | `ACCESS_GRANTED` | Borrower or secured party |
 | `DISPUTE_RAISED` | Any admitted party |
 | `DISPUTE_RESOLVED` | Operator (after the agreed dispute process) |

@@ -63,26 +63,31 @@ CREATE TABLE attester_accreditation (
 
 -- Each class defines which fields identify an asset uniquely and which
 -- attestation must exist before the asset can be pledged.
+--
+-- Divisible classes hold a quantity of interchangeable units (shares, bushels,
+-- bond face amount). Their required attestation carries the quantity held, and
+-- pledges take a quantity of units rather than the whole asset.
 CREATE TABLE asset_class (
     code                  TEXT PRIMARY KEY,
     name                  TEXT NOT NULL,
     identity_fields       TEXT NOT NULL,   -- JSON array of field names used for the fingerprint
-    required_attestation  TEXT NOT NULL
+    required_attestation  TEXT NOT NULL,
+    divisible             INTEGER NOT NULL DEFAULT 0 CHECK (divisible IN (0, 1))
 );
 
-INSERT INTO asset_class (code, name, identity_fields, required_attestation) VALUES
+INSERT INTO asset_class (code, name, identity_fields, required_attestation, divisible) VALUES
     ('EQUIPMENT',     'Serial-numbered equipment',
-                      '["manufacturer","serial_number"]', 'IDENTITY'),
+                      '["manufacturer","serial_number"]', 'IDENTITY', 0),
     ('VEHICLE',       'Titled motor vehicle',
-                      '["vin"]', 'IDENTITY'),
+                      '["vin"]', 'IDENTITY', 0),
     ('RECEIVABLE',    'Account receivable (invoice)',
                       '["seller_registration_id","obligor_registration_id","invoice_number","amount_minor","currency","issue_date"]',
-                      'OBLIGOR_CONFIRMATION'),
+                      'OBLIGOR_CONFIRMATION', 0),
     ('WAREHOUSE_LOT', 'Inventory held under a warehouse receipt',
-                      '["warehouse_registration_id","receipt_number"]', 'EXISTENCE'),
+                      '["warehouse_registration_id","receipt_number"]', 'EXISTENCE', 1),
     ('SECURITY_HOLDING', 'Shares or bonds held directly on the issuer''s or transfer agent''s books',
                       '["issuer_registration_id","share_class","holder_registration_id","position_id"]',
-                      'OWNERSHIP');
+                      'OWNERSHIP', 1);
 
 -- The asset record. The fingerprint is a keyed hash of the normalized identity
 -- fields: the same physical asset always produces the same fingerprint, however
@@ -109,6 +114,7 @@ CREATE TABLE attestation (
                        ('EXISTENCE', 'IDENTITY', 'OWNERSHIP', 'OBLIGOR_CONFIRMATION', 'VALUATION')),
     statement_hash     TEXT NOT NULL,      -- hash of the full statement kept off-ledger
     valuation_minor    INTEGER,            -- only for VALUATION
+    quantity           INTEGER,            -- units held; divisible classes only
     currency           TEXT,
     attested_seq       INTEGER NOT NULL REFERENCES ledger_event(seq),
     expires_at         TEXT,               -- valuations and inspections go stale
@@ -120,7 +126,11 @@ CREATE TABLE attestation (
 -- Pledges
 -- ---------------------------------------------------------------------------
 
--- A security interest in one asset. The contract itself stays off-ledger;
+-- A security interest in one asset. For divisible assets, each pledge takes its
+-- own block of units from the unpledged balance: SUM(quantity) of active pledges
+-- may never exceed the attested holding (enforced by the registry on every
+-- pledge, top-up and attestation). Each block is first in line on its own units.
+-- The contract itself stays off-ledger;
 -- only its salted hash is recorded, so outsiders can check a copy they are
 -- shown without the registry publishing the terms.
 CREATE TABLE pledge (
@@ -129,6 +139,7 @@ CREATE TABLE pledge (
     borrower_party_id   TEXT NOT NULL REFERENCES party(party_id),
     secured_party_id    TEXT NOT NULL REFERENCES party(party_id),
     max_secured_minor   INTEGER NOT NULL,  -- cap on what this pledge can claim
+    quantity            INTEGER,           -- units pledged; divisible classes only, NULL otherwise
     currency            TEXT NOT NULL,
     contract_hash       TEXT NOT NULL,     -- sha256(salt || contract bytes)
     contract_uri        TEXT,              -- access-controlled off-ledger location
@@ -189,7 +200,7 @@ CREATE TABLE dispute (
 --   APPRAISAL          {"value_minor", "as_of", "valid_days"}
 --   STRAIGHT_LINE      {"basis_minor", "basis_date", "useful_life_years", "salvage_minor"}
 --   DECLINING_BALANCE  {"basis_minor", "basis_date", "annual_rate_bp", "salvage_minor"}
---   MARKET_PRICE       {"instrument_id", "quantity", "source_id"}
+--   MARKET_PRICE       {"instrument_id", "source_id"}  (quantity comes from the attested holding)
 CREATE TABLE valuation_model (
     model_id        TEXT PRIMARY KEY,
     asset_id        TEXT NOT NULL REFERENCES asset(asset_id),
@@ -271,7 +282,7 @@ CREATE TABLE ledger_event (
                     'ASSET_REGISTERED', 'ATTESTED', 'ATTESTATION_REVOKED',
                     'VALUATION_MODEL_SET', 'PRICE_RECORDED',
                     'PLEDGE_RECORDED', 'PLEDGE_AMENDED', 'SUBORDINATED', 'PLEDGE_RELEASED',
-                    'COVENANT_SET',
+                    'COVENANT_SET', 'QUANTITY_ADJUSTED',
                     'ACCESS_GRANTED', 'DISPUTE_RAISED', 'DISPUTE_RESOLVED')),
     subject_id    TEXT NOT NULL,           -- asset_id, pledge_id, party_id, ...
     payload       TEXT NOT NULL,           -- canonical JSON (sorted keys, no whitespace)
@@ -334,7 +345,8 @@ SELECT p.pledge_id,
        p.status,
        e.recorded_at,
        p.ucc_state,
-       p.ucc_file_number
+       p.ucc_file_number,
+       p.quantity
 FROM pledge p
 JOIN party sp       ON sp.party_id = p.secured_party_id
 JOIN ledger_event e ON e.seq = p.recorded_seq;
@@ -355,3 +367,17 @@ SELECT a.asset_id,
        (SELECT COUNT(*) FROM pledge p
          WHERE p.asset_id = a.asset_id AND p.status = 'ACTIVE')   AS active_pledges
 FROM asset a;
+
+-- Units held, pledged and free for every divisible asset.
+CREATE VIEW holding_position AS
+SELECT a.asset_id,
+       (SELECT t.quantity FROM attestation t
+          JOIN asset_class c ON c.code = a.asset_class
+         WHERE t.asset_id = a.asset_id AND t.attestation_type = c.required_attestation
+           AND t.quantity IS NOT NULL AND t.revoked_at IS NULL
+         ORDER BY t.attested_seq DESC LIMIT 1)                    AS attested_quantity,
+       COALESCE((SELECT SUM(p.quantity) FROM pledge p
+                  WHERE p.asset_id = a.asset_id AND p.status = 'ACTIVE'), 0) AS pledged_quantity
+FROM asset a
+JOIN asset_class c ON c.code = a.asset_class
+WHERE c.divisible = 1;

@@ -16,6 +16,7 @@
 | Guessing pledged invoices | Hash likely invoice values, compare | Fingerprint uses a secret key held by the operator | Operator compromise exposes the key |
 | Stale valuation | Equipment worth less a year later | Depreciation schedules; appraisals expire; STALE overrides PASS | Real-world wear differs from the schedule |
 | Bad or manipulated price | Feed publishes a wrong price, or a thinly traded stock is pushed up | Signed prices, accredited sources, staleness limits, haircuts | One source is a single point of failure; use the median of several |
+| Pledged shares sold outside the registry | Holder sells 50,000 shares already pledged | Transfer agent re-attests the holding; overpledge freezes the asset and opens a dispute | Lag until the next attestation |
 | Inflated depreciation schedule | Appraiser sets an unrealistically long useful life | Accreditation, bonds, re-appraisal requirements | Collusion between borrower and appraiser |
 
 ## Open questions

@@ -85,6 +85,11 @@ class CovenantResult:
     ratio: Optional[float]         # coverage multiple or LTV fraction; inf when unbounded
     breach_value_minor: Optional[int]
     result: str
+    quantity: Optional[int] = None  # units in this pledge, for divisible assets
+
+    def trigger_price_minor(self):
+        """Per-unit price at which a divisible pledge breaches."""
+        return self.breach_value_minor // self.quantity if self.quantity and self.breach_value_minor else None
 
     def ratio_text(self):
         if self.ratio is None:
@@ -96,6 +101,10 @@ class CovenantResult:
     def threshold_text(self):
         t = self.threshold_bp / 10000
         return f"min {t:.2f}x" if self.kind == "MIN_COVERAGE" else f"max {t:.0%} LTV"
+
+
+class QuantityError(Exception):
+    """A pledge or attestation would put more units under pledge than the holder has."""
 
 
 class DuplicateAsset(Exception):
@@ -198,24 +207,74 @@ class Registry:
         )
         return asset_id
 
-    def attest(self, attester, asset_id, attestation_type, statement, valuation_minor=None):
+    def attest(self, attester, asset_id, attestation_type, statement, valuation_minor=None, quantity=None):
         self._require_accreditation(attester, asset_id, attestation_type)
         statement_hash = sha256(canonical(statement))
         seq = self._append("ATTESTED", asset_id,
                            {"type": attestation_type, "statement_hash": statement_hash,
-                            "valuation_minor": valuation_minor}, [attester])
+                            "valuation_minor": valuation_minor, "quantity": quantity}, [attester])
         attestation_id = new_id("att")
         self.db.execute(
             "INSERT INTO attestation (attestation_id, asset_id, attester_party_id, attestation_type,"
-            " statement_hash, valuation_minor, currency, attested_seq) VALUES (?,?,?,?,?,?,?,?)",
+            " statement_hash, valuation_minor, currency, quantity, attested_seq) VALUES (?,?,?,?,?,?,?,?,?)",
             (attestation_id, asset_id, attester.party_id, attestation_type, statement_hash,
-             valuation_minor, "USD" if valuation_minor else None, seq),
+             valuation_minor, "USD" if valuation_minor else None, quantity, seq),
         )
+        if quantity is not None:
+            self._flag_if_overpledged(asset_id)
         return attestation_id
+
+    # -- holdings (divisible assets) -----------------------------------------
+
+    def is_divisible(self, asset_id):
+        return bool(self.db.execute("SELECT c.divisible FROM asset a JOIN asset_class c ON c.code = a.asset_class"
+                                    " WHERE a.asset_id = ?", (asset_id,)).fetchone()[0])
+
+    def holding(self, asset_id):
+        """(attested, pledged, free) units for a divisible asset."""
+        row = self.db.execute("SELECT * FROM holding_position WHERE asset_id = ?", (asset_id,)).fetchone()
+        attested = row["attested_quantity"] or 0
+        return attested, row["pledged_quantity"], attested - row["pledged_quantity"]
+
+    def _flag_if_overpledged(self, asset_id):
+        # The attester reports a fact; if it shows fewer units than are pledged, the
+        # registry doesn't reject the fact. It freezes the asset for the parties to resolve.
+        attested, pledged, _ = self.holding(asset_id)
+        if pledged > attested:
+            seq = self._append("DISPUTE_RAISED", asset_id,
+                               {"reason": "OVERPLEDGED", "pledged": pledged, "attested": attested}, [])
+            self.db.execute("UPDATE asset SET status = 'DISPUTED' WHERE asset_id = ?", (asset_id,))
+            self.db.execute(
+                "INSERT INTO dispute (dispute_id, subject_type, subject_id, raised_by, reason, raised_seq)"
+                " SELECT ?, 'ASSET', ?, owner_party_id, ?, ? FROM asset WHERE asset_id = ?",
+                (new_id("dsp"), asset_id, f"overpledged: {pledged:,} units pledged, {attested:,} held", seq, asset_id))
+
+    def _require_free_units(self, asset_id, quantity):
+        if not quantity or quantity <= 0:
+            raise QuantityError("a pledge on a divisible asset needs a positive quantity")
+        _, _, free = self.holding(asset_id)
+        if quantity > free:
+            raise QuantityError(f"only {free:,} units are unpledged; {quantity:,} requested")
+
+    def adjust_quantity(self, attester, asset_id, ratio_num, ratio_den, reason):
+        """Apply a stock split or consolidation to the holding and every active pledge on it."""
+        self._require_accreditation(attester, asset_id, "OWNERSHIP")
+        attested, _, _ = self.holding(asset_id)
+        new_total = attested * ratio_num // ratio_den
+        seq = self._append("QUANTITY_ADJUSTED", asset_id,
+                           {"ratio": [ratio_num, ratio_den], "reason": reason, "new_quantity": new_total}, [attester])
+        self.db.execute(
+            "INSERT INTO attestation (attestation_id, asset_id, attester_party_id, attestation_type,"
+            " statement_hash, quantity, attested_seq) VALUES (?,?,?,'OWNERSHIP',?,?,?)",
+            (new_id("att"), asset_id, attester.party_id, sha256(canonical({"reason": reason})), new_total, seq))
+        # Fractional units are rounded down; the issuer settles them in cash.
+        self.db.execute("UPDATE pledge SET quantity = quantity * ? / ? WHERE asset_id = ? AND status = 'ACTIVE'",
+                        (ratio_num, ratio_den, asset_id))
+        return new_total
 
     # -- pledges -------------------------------------------------------------
 
-    def record_pledge(self, borrower, lender, asset_id, contract, salt, max_secured_minor, ucc):
+    def record_pledge(self, borrower, lender, asset_id, contract, salt, max_secured_minor, ucc, quantity=None):
         required = self.db.execute(
             "SELECT c.required_attestation FROM asset a JOIN asset_class c ON c.code = a.asset_class"
             " WHERE a.asset_id = ? AND a.status = 'ACTIVE'", (asset_id,)).fetchone()
@@ -225,38 +284,62 @@ class Registry:
                 "SELECT 1 FROM attestation WHERE asset_id = ? AND attestation_type = ? AND revoked_at IS NULL",
                 (asset_id, required[0])).fetchone():
             raise ValueError(f"asset needs a {required[0]} attestation before it can be pledged")
+        if self.is_divisible(asset_id):
+            self._require_free_units(asset_id, quantity)
+        elif quantity is not None:
+            raise QuantityError("this asset class is pledged whole; quantity must be omitted")
 
         pledge_id = new_id("plg")
         contract_hash = sha256(salt + contract)
         payload = {"asset_id": asset_id, "borrower": borrower.party_id, "secured_party": lender.party_id,
-                   "max_secured_minor": max_secured_minor, "contract_hash": contract_hash}
+                   "max_secured_minor": max_secured_minor, "quantity": quantity, "contract_hash": contract_hash}
         seq = self._append("PLEDGE_RECORDED", pledge_id, payload, [borrower, lender])
         self.db.execute(
             "INSERT INTO pledge (pledge_id, asset_id, borrower_party_id, secured_party_id, max_secured_minor,"
-            " currency, contract_hash, ucc_state, ucc_file_number, effective_at, recorded_seq)"
-            " VALUES (?,?,?,?,?,'USD',?,?,?,?,?)",
-            (pledge_id, asset_id, borrower.party_id, lender.party_id, max_secured_minor, contract_hash,
+            " quantity, currency, contract_hash, ucc_state, ucc_file_number, effective_at, recorded_seq)"
+            " VALUES (?,?,?,?,?,?,'USD',?,?,?,?,?)",
+            (pledge_id, asset_id, borrower.party_id, lender.party_id, max_secured_minor, quantity, contract_hash,
              ucc[0], ucc[1], now(), seq),
         )
         self._rerank(asset_id)
         return pledge_id
 
-    def release(self, lender, pledge_id):
-        row = self.db.execute("SELECT asset_id, secured_party_id FROM pledge WHERE pledge_id = ?",
-                              (pledge_id,)).fetchone()
+    def release(self, lender, pledge_id, quantity=None, new_cap_minor=None):
+        """Release a pledge, or only some of its units (with a lower cap) after a paydown."""
+        row = self.db.execute("SELECT asset_id, secured_party_id, quantity, max_secured_minor FROM pledge"
+                              " WHERE pledge_id = ?", (pledge_id,)).fetchone()
         if row["secured_party_id"] != lender.party_id:
             raise PermissionError("only the secured party can release a pledge")
+        if quantity is not None and quantity < row["quantity"]:
+            cap = new_cap_minor if new_cap_minor is not None else row["max_secured_minor"]
+            self._append("PLEDGE_RELEASED", pledge_id,
+                         {"pledge_id": pledge_id, "units_released": quantity, "new_cap_minor": cap}, [lender])
+            self.db.execute("UPDATE pledge SET quantity = quantity - ?, max_secured_minor = ? WHERE pledge_id = ?",
+                            (quantity, cap, pledge_id))
+            return
         seq = self._append("PLEDGE_RELEASED", pledge_id, {"pledge_id": pledge_id}, [lender])
         self.db.execute("UPDATE pledge SET status = 'RELEASED', priority_rank = NULL, released_seq = ?"
                         " WHERE pledge_id = ?", (seq, pledge_id))
         self._rerank(row["asset_id"])
+
+    def top_up(self, borrower, lender, pledge_id, additional_quantity):
+        """Add free units to an existing pledge, e.g. to cure a margin call."""
+        asset_id = self.db.execute("SELECT asset_id FROM pledge WHERE pledge_id = ?", (pledge_id,)).fetchone()[0]
+        self._require_free_units(asset_id, additional_quantity)
+        self._append("PLEDGE_AMENDED", pledge_id, {"pledge_id": pledge_id, "units_added": additional_quantity},
+                     [borrower, lender])
+        self.db.execute("UPDATE pledge SET quantity = quantity + ? WHERE pledge_id = ?",
+                        (additional_quantity, pledge_id))
 
     def _rerank(self, asset_id):
         # Default rule: first recorded, first in line. (Subordination events would
         # reorder this; left out of the examples to keep them short.)
         active = self.db.execute("SELECT pledge_id FROM pledge WHERE asset_id = ? AND status = 'ACTIVE'"
                                  " ORDER BY recorded_seq", (asset_id,)).fetchall()
+        divisible = self.is_divisible(asset_id)
         for rank, row in enumerate(active, start=1):
+            # On a divisible asset each pledge holds its own units, so every one is first in line.
+            rank = 1 if divisible else rank
             self.db.execute("UPDATE pledge SET priority_rank = ? WHERE pledge_id = ?", (rank, row[0]))
 
     def verify_contract(self, pledge_id, contract, salt):
@@ -332,9 +415,10 @@ class Registry:
             return Valuation(None, "NO_PRICE", method, f"no price for {p['instrument_id']}")
         age = (as_of - parse_ts(obs["observed_at"])).total_seconds()
         status = "STALE" if age > source["max_staleness_seconds"] else "OK"
+        quantity = self.holding(asset_id)[0]
         price = obs["price_minor"] / 100
-        detail = f"{p['quantity']:,} × ${price:,.2f}, priced {obs['observed_at'][:10]}"
-        return Valuation(p["quantity"] * obs["price_minor"], status, method, detail, obs["observation_id"])
+        detail = f"{quantity:,} × ${price:,.2f}, priced {obs['observed_at'][:10]}"
+        return Valuation(quantity * obs["price_minor"], status, method, detail, obs["observation_id"])
 
     # -- covenants -----------------------------------------------------------
 
@@ -356,20 +440,33 @@ class Registry:
         as_of = parse_ts(as_of)
         reported = reported_balances or {}
         val = self.value_at(asset_id, as_of)
+        divisible = self.is_divisible(asset_id)
+        total_units = self.holding(asset_id)[0] if divisible else None
         pledges = self.db.execute(
-            "SELECT p.pledge_id, p.priority_rank, p.max_secured_minor, s.legal_name"
+            "SELECT p.pledge_id, p.priority_rank, p.max_secured_minor, p.quantity, s.legal_name"
             " FROM pledge p JOIN party s ON s.party_id = p.secured_party_id"
             " WHERE p.asset_id = ? AND p.status = 'ACTIVE' ORDER BY p.priority_rank", (asset_id,)).fetchall()
         results, senior_claims = [], 0
         for p in pledges:
             exposure = reported.get(p["pledge_id"], p["max_secured_minor"])
             basis = "REPORTED" if p["pledge_id"] in reported else "CAP"
+            if divisible:
+                # Each pledge is valued on its own units, with nothing ranked ahead of it.
+                base, seniors = self._slice(val, p["quantity"], total_units), 0
+            else:
+                base, seniors = val, senior_claims
             for c in self.db.execute("SELECT * FROM covenant WHERE pledge_id = ?", (p["pledge_id"],)).fetchall():
-                results.append(self._evaluate(c, p, val, senior_claims, exposure, basis, as_of))
+                results.append(self._evaluate(c, p, base, seniors, exposure, basis, as_of))
             # Juniors count every senior pledge at its full cap: a revolving senior loan
             # can be drawn back up to the cap, and juniors can't see senior balances.
             senior_claims += p["max_secured_minor"]
         return val, results
+
+    @staticmethod
+    def _slice(val, units, total_units):
+        value = val.value_minor * units // total_units if val.value_minor is not None and total_units else None
+        return Valuation(value, val.status, val.method, f"{units:,} of {total_units:,} units",
+                         val.price_observation_id)
 
     def _evaluate(self, c, p, val, senior_claims, exposure, basis, as_of):
         threshold = c["threshold_bp"] / 10000
@@ -401,13 +498,15 @@ class Registry:
              available, exposure, basis, ratio_bp, breach_value, outcome, val.price_observation_id, now()),
         )
         return CovenantResult(c["covenant_id"], p["pledge_id"], p["legal_name"], p["priority_rank"], c["kind"],
-                              c["threshold_bp"], exposure, basis, available, ratio, breach_value, outcome)
+                              c["threshold_bp"], exposure, basis, available, ratio, breach_value, outcome,
+                              p["quantity"])
 
     def projected_breach_date(self, asset_id, result, start, horizon_years=30):
         """For depreciating assets, the first month the value drops below a covenant's breach value."""
         model = self.db.execute("SELECT method FROM valuation_model WHERE asset_id = ? AND superseded_seq IS NULL",
                                 (asset_id,)).fetchone()
-        if not model or model["method"] not in SCHEDULE_METHODS or result.breach_value_minor is None:
+        if (not model or model["method"] not in SCHEDULE_METHODS or result.breach_value_minor is None
+                or self.is_divisible(asset_id)):
             return None
         t = parse_ts(start)
         if self.value_at(asset_id, t).value_minor < result.breach_value_minor:
