@@ -45,3 +45,7 @@ The demo simulates signatures with HMAC so it has no dependencies. A real system
 ## Status
 
 Concept and reference model only. It isn't legal advice and doesn't replace UCC filing, which lenders still need for legal priority.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
